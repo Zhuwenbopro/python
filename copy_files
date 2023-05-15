@@ -1,0 +1,33 @@
+import os
+import shutil
+import sys
+
+source = 'C:\\Users\\11381\\Desktop\\dataset'
+# 复制去到的文件夹
+destination = 'C:\\Users\\11381\\Desktop\\数据集'
+
+def checkExist(src, dest):
+    if (os.path.exists(src) == False):
+        return False
+    if (os.path.exists(dest) == False):
+        os.mkdir(dest)
+    for item in os.scandir(src):
+        expected = os.path.join(dest, item.name)
+        if(item.is_dir()):
+            if(checkExist(item.path, expected) == False): # check inside
+                return False
+        else:
+            if (os.path.exists(expected) == False):
+                # copy file
+                try:
+                    shutil.copy(item.path, expected)
+                except IOError as e:
+                    print("Unable to copy file. %s" % e)
+                except:
+                    print("Unexpected error:", sys.exc_info())
+    return True
+
+if(checkExist(source, destination)):
+    print("迁移成功")
+else:
+    print("迁移失败")
