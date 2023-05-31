@@ -1,0 +1,371 @@
+import pandas as pd
+from torch_snippets import *
+import selectivesearch
+from torchvision import transforms, models, datasets
+from torch_snippets import Report
+from torchvision.ops import nms
+
+import warnings
+warnings.filterwarnings("ignore")
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+IMAGE_ROOT = './data/images/images'
+DF_RAW = pd.read_csv('./data/df.csv')
+
+
+# 看看df.csv里面都是啥
+# print(DF_RAW.head())
+
+# 准备好数据集
+# 一次提供一张图片、这张图片里面的所有框、框属于哪个类、图片在哪存储
+class Dataset(Dataset):
+    def __init__(self, df, image_folder=IMAGE_ROOT):
+        self.root = image_folder
+        self.df = df
+        # unique() 返回参数数组中所有不同的值，并按照从小到大排序
+        self.images = df['ImageID'].unique()
+
+    def __len__(self): return len(self.images)
+
+    def __getitem__(self, ix):
+        img_id = self.images[ix]
+        img_path = f'{self.root}/{img_id}.jpg'
+        image = cv2.imread(img_path, 1)
+        h, w, _ = image.shape
+        df = self.df.copy()
+        # 把所有box都搞出来
+        df = df[df['ImageID'] == img_id]
+        boxes = df['XMin,YMin,XMax,YMax'.split(',')].values
+        boxes = (boxes * np.array([w, h, w, h])).astype(np.uint16).tolist()
+        classes = df['LabelName'].values.tolist()
+        """
+        返回：
+        cv2格式下的图像
+        图像中所有的bounding box[[x1,y1,x2,y2],[x1,y1,x2,y2],[x1,y1,x2,y2]]
+        图像中所有的类 list [truck, car, car]
+        图像路径 str
+        """
+        return image, boxes, classes, img_path
+
+
+ds = Dataset(df=DF_RAW)
+"""
+im, bbs, clss, _ = ds[9]
+show(im, bbs=bbs, texts=clss, sz=10)
+print(_)
+"""
+
+
+# 使用 selectivesearch 提取出一个图片里所有的可能框
+def extract_candidates(img):
+    img_lbl, regions = selectivesearch.selective_search(img, scale=200, min_size=100)
+    img_area = np.prod(img.shape[:2])
+    candidates = []
+    for r in regions:
+        if r['rect'] in candidates: continue
+        if r['size'] < (0.05 * img_area): continue
+        if r['size'] > (1 * img_area): continue
+        x, y, w, h = r['rect']
+        candidates.append(list(r['rect']))
+    return candidates
+
+
+# 计算 intersection / union 函数
+def extract_iou(boxA, boxB, epsilon=1e-5):
+    x1 = max(boxA[0], boxB[0])
+    y1 = max(boxA[1], boxB[1])
+    x2 = min(boxA[2], boxB[2])
+    y2 = min(boxA[3], boxB[3])
+    width = (x2 - x1)
+    height = (y2 - y1)
+    if (width < 0) or (height < 0):
+        return 0.0
+    area_overlap = width * height
+    area_a = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    area_b = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    area_combined = area_a + area_b - area_overlap
+    iou = area_overlap / (area_combined + epsilon)
+    return iou
+
+
+"""
+FPATHS  : 文件路径                    str
+GTBBS   : 真值框                     [] 2
+RPS     : region proposal locations [] 33
+IOUS    : IoU of region proposals   [] 33
+CLSS    : 种类                       [] 33
+DELTAS  : the delta offset          [] 33
+"""
+FPATHS, GTBBS, CLSS, DELTAS, RPS, IOUS = [], [], [], [], [], []
+
+N = 100  # 对500张图片进行分析
+for ix, (im, bbs, labels, fpath) in enumerate(ds):
+    if ix == N:
+        break
+    H, W, _ = im.shape
+    # 左上角、宽、高
+    candidates = extract_candidates(im)
+    # 改成对角存储 [[x1,y1,x2,y2],[x1,y1,x2,y2],[x1,y1,x2,y2]]
+    candidates = np.array([(x, y, x + w, y + h) for x, y, w, h in candidates])
+    ious, rps, clss, deltas = [], [], [], []
+    # 算出所有region proposal（m）对于图片中所有标注bounding box（n）的IOU（m*n）[[m],[m],...,[m]]
+    ious = np.array([[extract_iou(candidate, _bb_) for candidate in candidates] for _bb_ in bbs]).T
+    for jx, candidate in enumerate(candidates):
+        cx, cy, cX, cY = candidate
+        candidate_ious = ious[jx]
+        # 找出其中最大的那个值的索引, non max supression
+        best_iou_at = np.argmax(candidate_ious)
+        best_iou = candidate_ious[best_iou_at]
+        best_bb = _x, _y, _X, _Y = bbs[best_iou_at]
+        if best_iou > 0.3:
+            clss.append(labels[best_iou_at])
+        else:
+            clss.append('background')
+        # 按比例存储 对角比例
+        delta = np.array([_x - cx, _y - cy, _X - cX, _Y - cY]) / np.array([W, H, W, H])
+        deltas.append(delta)
+        rps.append(candidate / np.array([W, H, W, H]))
+    FPATHS.append(fpath)
+    IOUS.append(ious)
+    RPS.append(rps)
+    CLSS.append(clss)
+    DELTAS.append(deltas)
+    GTBBS.append(bbs)
+
+## 这里看不懂在干啥
+# FPATHS = [f'{IMAGE_ROOT}/{stem(f)}.jpg' for f in FPATHS]
+# FPATHS, GTBBS, CLSS, DELTAS, RPS = [item for item in [FPATHS, GTBBS, CLSS, DELTAS, RPS]]
+
+
+# label <---> target
+targets = pd.DataFrame(flatten(CLSS), columns=['label'])
+label2target = {l: t for t, l in enumerate(targets['label'].unique())}
+target2label = {t: l for l, t in label2target.items()}
+background_class = label2target['background']
+
+# training data
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+
+
+def preprocess_image(img):
+    img = torch.tensor(img).permute(2, 0, 1)
+    img = normalize(img)
+    return img.to(device).float()
+
+
+def decode(_y):
+    _, preds = _y.max(-1)
+    return preds
+
+
+class RCNNDataset(Dataset):
+    def __init__(self, fpaths, rps, labels, deltas, gtbbs):
+        self.fpaths = fpaths
+        self.gtbbs = gtbbs
+        self.rps = rps
+        self.labels = labels
+        self.deltas = deltas
+
+    def __len__(self): return len(self.fpaths)
+
+    def __getitem__(self, ix):
+        fpath = str(self.fpaths[ix])
+        image = cv2.imread(fpath, 1)[..., ::-1]
+        H, W, _ = image.shape
+        sh = np.array([W, H, W, H])
+        gtbbs = self.gtbbs[ix]  # bounding box
+        rps = (np.array(self.rps[ix]) * sh).astype(np.uint16)  # region proposals
+        labels = self.labels[ix]  # class
+        deltas = self.deltas[ix]  # offset
+        crops = [image[y:Y, x:X] for (x, y, X, Y) in rps]  # images of region proposals
+        return crops, rps, labels, deltas, gtbbs, fpath
+
+    # data augmentation
+    def collate_fn(self, batch):
+        input, labels, deltas = [], [], []
+        for ix in range(len(batch)):
+            crops, image_rps, image_labels, image_deltas, image_gt_bbs, image_fpath = batch[ix]
+            # 处理好 crops 好输入
+            crops = [cv2.resize(crop, (224, 224)) for crop in crops]
+            crops = [preprocess_image(crop / 255.)[None] for crop in crops]
+            input.extend(crops)  # region proposals  : input
+            labels.extend([label2target[c] for c in image_labels])  # class             : output1
+            deltas.extend(image_deltas)  # offset            : output2
+        # 为什么变成inputs cat呢？？？
+        # print(input[0].shape) torch.Size([1, 3, 224, 224])
+        input = torch.cat(input).to(device)
+        # print(input.shape) torch.Size([81, 3, 224, 224])
+        labels = torch.Tensor(labels).long().to(device)
+        deltas = torch.Tensor(deltas).float().to(device)
+        return input, labels, deltas
+
+
+# 5//2=2（2.5向负无穷方向取整为2）
+n_train = 9 * len(FPATHS) // 10
+# FPATHS[:n_train]  前 n_train 个数，分训练集与测试集
+train_ds = RCNNDataset(FPATHS[:n_train], RPS[:n_train], CLSS[:n_train], DELTAS[:n_train], GTBBS[:n_train])
+test_ds = RCNNDataset(FPATHS[n_train:], RPS[n_train:], CLSS[n_train:], DELTAS[n_train:], GTBBS[n_train:])
+
+from torch.utils.data import DataLoader
+
+train_loader = DataLoader(train_ds, batch_size=2, collate_fn=train_ds.collate_fn, drop_last=True)
+test_loader = DataLoader(test_ds, batch_size=2, collate_fn=test_ds.collate_fn, drop_last=True)
+
+# vgg预训练模型，不修改变量（因为这个模型已经能区分 car & truck 了
+vgg_backbone = models.vgg16(pretrained=True)
+vgg_backbone.classifier = nn.Sequential()
+for param in vgg_backbone.parameters():
+    param.requires_grad = False
+vgg_backbone.eval().to(device)
+
+
+class RCNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        feature_dim = 25088
+        self.backbone = vgg_backbone
+        # 识别是 car 还是 truck 还是 background
+        self.cls_score = nn.Linear(feature_dim, len(label2target))
+        self.cel = nn.CrossEntropyLoss()
+
+        # 识别边框 o为什么是4个输出呢？？？
+        self.bbox = nn.Sequential(
+            nn.Linear(feature_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 4),
+            nn.Tanh(),
+        )
+        self.sl1 = nn.L1Loss()  # 绝对值、 l2Loss 是 MSEloss（平方）
+
+    def forward(self, input):
+        feat = self.backbone(input)
+        cls_score = self.cls_score(feat)
+        bbox = self.bbox(feat)
+        return cls_score, bbox
+
+    def calc_loss(self, _labels, _deltas, labels, deltas):
+        detection_loss = self.cel(_labels, labels)  # CrossEntropyLoss
+        # Note that we do not calculate regression loss corresponding
+        # to offsets if the actual class is of the background:
+        ixs, = torch.where(labels != 0)  # ixs labels有不为零的行数 _ 第几列
+        _deltas = _deltas[ixs]
+        deltas = deltas[ixs]
+        self.lmb = 10.0
+        if len(ixs) > 0:
+            regression_loss = self.sl1(_deltas, deltas)
+            # detach 意为分离，返回一个 TensorTensor，它和原张量的数据相同， 但 requires_grad = False
+            # detach() 得到的张量不会具有梯度。
+            return detection_loss + self.lmb * regression_loss, detection_loss.detach(), regression_loss.detach()
+        else:
+            regression_loss = 0
+            return detection_loss + self.lmb * regression_loss, detection_loss.detach(), regression_loss
+
+
+def train_batch(inputs, model, optimizer, criterion):
+    input, clss, deltas = inputs
+    model.train()
+    optimizer.zero_grad()
+    _clss, _deltas = model(input)
+    loss, loc_loss, regr_loss = criterion(_clss, _deltas, clss, deltas)
+    accs = clss == decode(_clss)
+    loss.backward()
+    optimizer.step()
+    # 准确度
+    return loss.detach(), loc_loss, regr_loss, accs.cpu().numpy()
+
+
+@torch.no_grad()
+def validate_batch(inputs, model, criterion):
+    input, clss, deltas = inputs
+    with torch.no_grad():
+        model.eval()
+        _clss, _deltas = model(input)
+        loss, loc_loss, regr_loss = criterion(_clss, _deltas, clss, deltas)
+        _, _clss = _clss.max(-1)    # _ 是 value，_clss 是坐标
+        accs = clss == _clss
+    return _clss, _deltas, loss.detach(), loc_loss, regr_loss, accs.cpu().numpy()
+
+
+rcnn = RCNN().to(device)
+criterion = rcnn.calc_loss
+optimizer = optim.SGD(rcnn.parameters(), lr=1e-3)
+n_epochs = 5
+log = Report(n_epochs)
+
+for epoch in range(n_epochs):
+
+    _n = len(train_loader)
+    for ix, inputs in enumerate(train_loader):
+        loss, loc_loss, regr_loss, accs = train_batch(inputs, rcnn, optimizer, criterion)
+        pos = (epoch + (ix + 1) / _n)
+        log.record(pos, trn_loss=loss.item(), trn_loc_loss=loc_loss,
+                   trn_regr_loss=regr_loss, trn_acc=accs.mean(), end='\r')
+
+    _n = len(test_loader)
+    for ix, inputs in enumerate(test_loader):
+        _clss, _deltas, loss, \
+        loc_loss, regr_loss, accs = validate_batch(inputs,
+                                                   rcnn, criterion)
+        pos = (epoch + (ix + 1) / _n)
+        log.record(pos, val_loss=loss.item(), val_loc_loss=loc_loss,
+                   val_regr_loss=regr_loss,
+                   val_acc=accs.mean(), end='\r')
+
+# Plotting training and validation metrics
+log.plot_epochs('trn_loss,val_loss'.split(','))
+
+
+def test_predictions(filename, show_output=True):
+    img = np.array(cv2.imread(filename, 1)[..., ::-1])
+    candidates = extract_candidates(img)
+    candidates = [(x, y, x + w, y + h) for x, y, w, h in candidates]
+    input = []
+    for candidate in candidates:
+        x, y, X, Y = candidate
+        crop = cv2.resize(img[y:Y, x:X], (224, 224))
+        input.append(preprocess_image(crop / 255.)[None])
+    input = torch.cat(input).to(device)
+    with torch.no_grad():
+        rcnn.eval()
+        probs, deltas = rcnn(input)
+        probs = torch.nn.functional.softmax(probs, -1)
+        confs, clss = torch.max(probs, -1)
+    candidates = np.array(candidates)
+    confs, clss, probs, deltas = [tensor.detach().cpu().numpy() for tensor in [confs, clss, probs, deltas]]
+
+    ixs = clss != background_class
+    confs, clss, probs, deltas, candidates = [tensor[ixs] for tensor in [confs, clss, probs, deltas, candidates]]
+    bbs = (candidates + deltas).astype(np.uint16)
+    ixs = nms(torch.tensor(bbs.astype(np.float32)), torch.tensor(confs), 0.05)
+    confs, clss, probs, deltas, candidates, bbs = [tensor[ixs] for tensor in
+                                                   [confs, clss, probs, deltas, candidates, bbs]]
+    if len(ixs) == 1:
+        confs, clss, probs, deltas, candidates, bbs = [tensor[None] for tensor in
+                                                       [confs, clss, probs, deltas, candidates, bbs]]
+    if len(confs) == 0 and not show_output:
+        return (0, 0, 224, 224), 'background', 0
+    if len(confs) > 0:
+        best_pred = np.argmax(confs)
+        best_conf = np.max(confs)
+        best_bb = bbs[best_pred]
+        x, y, X, Y = best_bb
+    _, ax = plt.subplots(1, 2, figsize=(20, 10))
+    show(img, ax=ax[0])
+    ax[0].grid(False)
+    ax[0].set_title('Original image')
+    if len(confs) == 0:
+        ax[1].imshow(img)
+        ax[1].set_title('No objects')
+        plt.show()
+        return
+    ax[1].set_title(target2label[clss[best_pred]])
+    show(img, bbs=bbs.tolist(), texts=[target2label[c] for c in clss.tolist()], ax=ax[1],
+         title='predicted bounding box and class')
+    plt.show()
+    return (x, y, X, Y), target2label[clss[best_pred]], best_conf
+
+
+crops, bbs, labels, deltas, gtbbs, fpath = test_ds[7]
+test_predictions(fpath)
